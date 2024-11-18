@@ -26,6 +26,8 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define ISspace(x) isspace((int)(x))
 
@@ -34,18 +36,78 @@
 #define STDOUT  1
 #define STDERR  2
 
-void accept_request(void *);
-void bad_request(int);
-void cat(int, FILE *);
-void cannot_execute(int);
-void error_die(const char *);
-void execute_cgi(int, const char *, const char *, const char *);
-int get_line(int, char *, int);
-void headers(int, const char *);
-void not_found(int);
-void serve_file(int, const char *);
-int startup(u_short *);
-void unimplemented(int);
+// 在文件开头添加新的响应头定义
+#define CONTENT_LENGTH "Content-Length: %d\r\n"
+#define CONTENT_TYPE "Content-Type: %s\r\n"
+#define CONNECTION "Connection: %s\r\n"
+#define DATE "Date: %s\r\n"
+
+/*
+ * 这是一个简单的HTTP服务器实现
+ * 主要功能：
+ * 1. 处理基本的HTTP GET和POST请求
+ * 2. 支持静态文件服务
+ * 3. 支持CGI脚本执行
+ * 4. 多线程处理客户端请求
+ */
+
+void accept_request(void *); // 处理HTTP请求
+void bad_request(int);      // 发送400错误响应
+void cat(int, FILE *);      // 发送文件内容
+void cannot_execute(int);   // 发送500错误响应
+void error_die(const char *); // 错误处理和退出
+void execute_cgi(int, const char *, const char *, const char *); // 执行CGI脚本
+int get_line(int, char *, int); // 读取一行HTTP请求
+void headers(int, const char *); // 发送HTTP响应头
+void not_found(int);        // 发送404错误响应
+void serve_file(int, const char *); // 处理静态文件请求
+int startup(u_short *);     // 启动服务器
+void unimplemented(int);    // 发送501错误响应
+void log_access(const char *format, ...); // 记录访问日志
+const char* get_content_type(const char *filename); // 添加这一行声明
+
+// 添加配置结构
+typedef struct {
+    int port;
+    char document_root[512];
+    int max_clients;
+    int timeout;
+} server_config;
+
+// 添加配置读取函数
+server_config read_config(const char *filename) 
+{
+    server_config config = {
+        .port = 4000,
+        .document_root = "htdocs",
+        .max_clients = 1000,
+        .timeout = 60
+    };
+    
+    FILE *fp = fopen(filename, "r");
+    if (fp == NULL) return config;
+    
+    char line[1024];
+    char key[64], value[960];
+    
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        if (sscanf(line, "%63[^=]=%959s", key, value) == 2) {
+            if (strcmp(key, "port") == 0)
+                config.port = atoi(value);
+            else if (strcmp(key, "document_root") == 0)
+                strncpy(config.document_root, value, sizeof(config.document_root)-1);
+            else if (strcmp(key, "max_clients") == 0)
+                config.max_clients = atoi(value);
+            else if (strcmp(key, "timeout") == 0)
+                config.timeout = atoi(value);
+        }
+    }
+    
+    fclose(fp);
+    return config;
+}
 
 /**********************************************************************/
 /* A request has caused a call to accept() on the server port to
@@ -54,40 +116,60 @@ void unimplemented(int);
 /**********************************************************************/
 void accept_request(void *arg)
 {
-    int client = (intptr_t)arg;
-    char buf[1024];
-    size_t numchars;
-    char method[255];
-    char url[255];
-    char path[512];
+    /* 处理HTTP请求的主要步骤：
+     * 1. 解析HTTP请求行，获取方法、URL和HTTP版本
+     * 2. 如果是GET请求，解析URL中的查询字符串
+     * 3. 如果是POST请求，获取Content-Length
+     * 4. 确定是否需要CGI处理（有查询字符串或POST请求）
+     * 5. 构建本地文件路径
+     * 6. 根据请求类型调用相应的处理函数
+     */
+    int client = (intptr_t)arg; // 将传入的参数转换为客户端套接字描述符
+    char buf[1024]; // 用于存储从客户端读取的数据
+    size_t numchars; // 读取的字符数
+    char method[255]; // 存储请求方法（GET 或 POST）
+    char url[255]; // 存储请求的 URL
+    char path[512]; // 存储请求的文件路径
     size_t i, j;
-    struct stat st;
-    int cgi = 0;      /* becomes true if server decides this is a CGI
-                       * program */
-    char *query_string = NULL;
+    struct stat st; // 用于获取文件状态信息
+    int cgi = 0; // 标记是否为 CGI 请求
+    char *query_string = NULL; // 存储查询字符串
 
+    /* 处理HTTP请求的主要步骤：
+     * 1. 解析HTTP请求方法（GET/POST）
+     * 2. 解析URL和查询字符串
+     * 3. 确定是否需要CGI处理
+     * 4. 处理静态文件或执行CGI脚本
+     */
+
+    // 获取HTTP请求的第一行
     numchars = get_line(client, buf, sizeof(buf));
-    i = 0; j = 0;
+    
+    // 解析HTTP方法（GET/POST）
     while (!ISspace(buf[i]) && (i < sizeof(method) - 1))
     {
         method[i] = buf[i];
         i++;
     }
-    j=i;
+    j = i;
     method[i] = '\0';
 
+    // 检查是否支持该HTTP方法
     if (strcasecmp(method, "GET") && strcasecmp(method, "POST"))
     {
         unimplemented(client);
         return;
     }
 
+    // POST请求一定需要CGI处理
     if (strcasecmp(method, "POST") == 0)
         cgi = 1;
 
     i = 0;
+    // 跳过空白字符
     while (ISspace(buf[j]) && (j < numchars))
         j++;
+    // 解析 URL
     while (!ISspace(buf[j]) && (i < sizeof(url) - 1) && (j < numchars))
     {
         url[i] = buf[j];
@@ -95,6 +177,10 @@ void accept_request(void *arg)
     }
     url[i] = '\0';
 
+    /* 处理GET请求的查询字符串
+     * 如果URL中包含?，则需要CGI处理
+     * 例如：/path?param=value
+     */
     if (strcasecmp(method, "GET") == 0)
     {
         query_string = url;
@@ -108,31 +194,70 @@ void accept_request(void *arg)
         }
     }
 
+    /* 构建本地文件路径
+     * 所有文件都存放在htdocs目录下
+     * 如果请求的是目录，默认返回index.html
+     */
     sprintf(path, "htdocs%s", url);
     if (path[strlen(path) - 1] == '/')
         strcat(path, "index.html");
+
+    // 检查文件是否存在和访问权限
     if (stat(path, &st) == -1) {
-        while ((numchars > 0) && strcmp("\n", buf))  /* read & discard headers */
+        // 文件不存在，返回404错误
+        while ((numchars > 0) && strcmp("\n", buf))
             numchars = get_line(client, buf, sizeof(buf));
         not_found(client);
     }
     else
     {
+        // 如果是目录，添加默认的index.html
         if ((st.st_mode & S_IFMT) == S_IFDIR)
             strcat(path, "/index.html");
+        
+        // 如果文件有执行权限，认为是CGI脚本
         if ((st.st_mode & S_IXUSR) ||
-                (st.st_mode & S_IXGRP) ||
-                (st.st_mode & S_IXOTH)    )
+            (st.st_mode & S_IXGRP) ||
+            (st.st_mode & S_IXOTH))
             cgi = 1;
+        
+        // 检查路径中是否包含 ..
+        if (strstr(url, "..") != NULL) {
+            bad_request(client);
+            return;
+        }
+        
+        // 检查请求的文件路径是否超出htdocs目录
+        char real_path[512];
+        char *htdocs_path = realpath("htdocs", NULL);
+        if (realpath(path, real_path) == NULL || 
+            strncmp(real_path, htdocs_path, strlen(htdocs_path)) != 0) {
+            not_found(client);
+            free(htdocs_path);
+            return;
+        }
+        free(htdocs_path);
+        
+        // 根据是否是CGI请求选择处理方式
         if (!cgi)
             serve_file(client, path);
         else
             execute_cgi(client, path, method, query_string);
     }
 
+    // 记录访问日志
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    getpeername(client, (struct sockaddr*)&addr, &addr_len);
+    
+    log_access("%s - \"%s %s\" %d", 
+               inet_ntoa(addr.sin_addr),
+               method,
+               url,
+               200); // 这里应该根据实际响应码修改
+               
     close(client);
 }
-
 /**********************************************************************/
 /* Inform the client that a request it has made has a problem.
  * Parameters: client socket */
@@ -210,6 +335,17 @@ void error_die(const char *sc)
 void execute_cgi(int client, const char *path,
         const char *method, const char *query_string)
 {
+    /* CGI脚本执行流程：
+     * 1. 创建两个管道用于父子进程通信
+     * 2. fork出子进程
+     * 3. 在子进程中：
+     *    - 重定向标准输入输出到管道
+     *    - 设置环境变量
+     *    - 执行CGI程序
+     * 4. 在父进程中：
+     *    - 如果是POST请求，将POST数据写入子进程
+     *    - 读取CGI程序的输出并发送给客户端
+     */
     char buf[1024];
     int cgi_output[2];
     int cgi_input[2];
@@ -351,15 +487,46 @@ int get_line(int sock, char *buf, int size)
 void headers(int client, const char *filename)
 {
     char buf[1024];
-    (void)filename;  /* could use filename to determine file type */
+    char date_str[100];
+    time_t now = time(0);
+    struct tm tm = *gmtime(&now);
+    const char *content_type;
+    struct stat st;
+    
+    // 获取文件大小
+    if (stat(filename, &st) == -1)
+        return;
+        
+    // 根据文件扩展名确定Content-Type
+    content_type = get_content_type(filename);
+    
+    // 格式化HTTP日期
+    strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    
+    // 发送基本响应头
+    sprintf(buf, "HTTP/1.1 200 OK\r\n");
+    send(client, buf, strlen(buf), 0);
+    sprintf(buf, SERVER_STRING);
+    send(client, buf, strlen(buf), 0);
+    sprintf(buf, DATE, date_str);
+    send(client, buf, strlen(buf), 0);
+    sprintf(buf, CONTENT_TYPE, content_type);
+    send(client, buf, strlen(buf), 0);
+    sprintf(buf, CONTENT_LENGTH, (int)st.st_size);
+    send(client, buf, strlen(buf), 0);
+    sprintf(buf, CONNECTION, "close");
+    send(client, buf, strlen(buf), 0);
+    sprintf(buf, "\r\n");
+    send(client, buf, strlen(buf), 0);
 
-    strcpy(buf, "HTTP/1.0 200 OK\r\n");
-    send(client, buf, strlen(buf), 0);
-    strcpy(buf, SERVER_STRING);
-    send(client, buf, strlen(buf), 0);
-    sprintf(buf, "Content-Type: text/html\r\n");
-    send(client, buf, strlen(buf), 0);
-    strcpy(buf, "\r\n");
+    // 对静态资源添加缓存控制
+    if (strstr(filename, ".html") || strstr(filename, ".htm")) {
+        // HTML文件不缓存
+        sprintf(buf, "Cache-Control: no-cache\r\n");
+    } else {
+        // 其他静态资源缓存1小时
+        sprintf(buf, "Cache-Control: public, max-age=3600\r\n");
+    }
     send(client, buf, strlen(buf), 0);
 }
 
@@ -428,6 +595,13 @@ void serve_file(int client, const char *filename)
 /**********************************************************************/
 int startup(u_short *port)
 {
+    /* 服务器启动流程：
+     * 1. 创建服务器套接字
+     * 2. 设置套接字选项（地址重用）
+     * 3. 绑定到指定端口（如果端口为0则动态分配）
+     * 4. 开始监听连接
+     * 返回：服务器套接字描述符
+     */
     int httpd = 0;
     int on = 1;
     struct sockaddr_in name;
@@ -488,6 +662,14 @@ void unimplemented(int client)
 
 int main(void)
 {
+    /* 主程序流程：
+     * 1. 初始化服务器，监听指定端口（默认4000）
+     * 2. 进入主循环：
+     *    - 接受新的客户端连接
+     *    - 为每个连接创建新线程处理请求
+     *    - 线程独立运行，主线程继续接受新连接
+     * 3. 服务器永久运行，除非发生错误或被手动终止
+     */
     int server_sock = -1;
     u_short port = 4000;
     int client_sock = -1;
@@ -495,9 +677,16 @@ int main(void)
     socklen_t  client_name_len = sizeof(client_name);
     pthread_t newthread;
 
+    /* 主函数：启动服务器并处理客户端连接 */
+
+    // 初始化服务器，监听指定端口
     server_sock = startup(&port);
     printf("httpd running on port %d\n", port);
 
+    /* 主循环：接受客户端连接并创建新线程处理请求
+     * 每个客户端连接都在独立的线程中处理
+     * 支持多个客户端同时连接
+     */
     while (1)
     {
         client_sock = accept(server_sock,
@@ -505,12 +694,63 @@ int main(void)
                 &client_name_len);
         if (client_sock == -1)
             error_die("accept");
-        /* accept_request(&client_sock); */
-        if (pthread_create(&newthread , NULL, (void *)accept_request, (void *)(intptr_t)client_sock) != 0)
+        
+        // 创建新线程处理请求
+        if (pthread_create(&newthread, NULL, (void *)accept_request, 
+                (void *)(intptr_t)client_sock) != 0)
             perror("pthread_create");
     }
 
     close(server_sock);
 
     return(0);
+}
+
+/**********************************************************************/
+/* 添加获取Content-Type的辅助函数 */
+/**********************************************************************/
+const char* get_content_type(const char *filename) 
+{
+    const char *dot = strrchr(filename, '.');
+    if (!dot) return "text/plain";
+    
+    if (strcasecmp(dot, ".html") == 0 || strcasecmp(dot, ".htm") == 0) 
+        return "text/html";
+    if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0)
+        return "image/jpeg";
+    if (strcasecmp(dot, ".gif") == 0)
+        return "image/gif";
+    if (strcasecmp(dot, ".png") == 0)
+        return "image/png";
+    if (strcasecmp(dot, ".css") == 0)
+        return "text/css";
+    if (strcasecmp(dot, ".js") == 0)
+        return "application/javascript";
+    if (strcasecmp(dot, ".pdf") == 0)
+        return "application/pdf";
+        
+    return "text/plain";
+}
+
+// 添加日志函数
+void log_access(const char *format, ...) 
+{
+    FILE *fp;
+    va_list arg_list;
+    char timestamp[100];
+    time_t now = time(NULL);
+    
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", 
+             localtime(&now));
+    
+    fp = fopen("access.log", "a");
+    if (fp == NULL) return;
+    
+    fprintf(fp, "[%s] ", timestamp);
+    va_start(arg_list, format);
+    vfprintf(fp, format, arg_list);
+    va_end(arg_list);
+    fprintf(fp, "\n");
+    
+    fclose(fp);
 }
